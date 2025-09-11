@@ -11,5 +11,5 @@ https://zhuanlan.zhihu.com/p/27676081245
 ### env setup guidence
 
 verl
-- install in custom env
+- install in custom env [[custom_env_install.md]](./env_setup/custom_env_install.md)
 - autodl
