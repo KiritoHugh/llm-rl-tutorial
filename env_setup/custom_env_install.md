@@ -10,5 +10,8 @@ bash scripts/install_vllm_sglang_mcore.sh
 
 # ... two thousands years latter
 
+- install apex
+
+- install verl
 
 ```
