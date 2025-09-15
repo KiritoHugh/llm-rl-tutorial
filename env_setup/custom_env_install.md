@@ -39,3 +39,7 @@ git clone https://github.com/volcengine/verl.git
 cd verl
 pip install --no-deps -e .
 ```
+
+- quick start test
+
+https://verl.readthedocs.io/en/latest/start/quickstart.html
