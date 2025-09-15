@@ -35,3 +35,7 @@ MAX_JOB=32 pip install -v --disable-pip-version-check --no-cache-dir --no-build-
 - install verl
 
 ```
+git clone https://github.com/volcengine/verl.git
+cd verl
+pip install --no-deps -e .
+```
