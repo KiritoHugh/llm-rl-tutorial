@@ -1,3 +1,10 @@
+    def fit(self):
+        """
+        The training loop of PPO.
+        The driver process only need to call the compute functions of the worker group through RPC
+        to construct the PPO dataflow.
+        The light-weight advantage computation is done on the driver process.
+        """
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     # gpt: 这里是整个训练 step 的主计时上下文，用于记录整个步骤的耗时。
