@@ -25,17 +25,28 @@
                 - final_batch: DataProto with selected samples and aligned context fields
                 - rounds_info: Dict with per-round statistics
         """
+        # gpt: 该函数用于执行“多轮自适应下采样”生成过程。
+        # gpt: 每一轮生成多个候选样本，根据 reward 值筛选出正样本和负样本，
+        # gpt: 若某个 prompt 已收集到足够多的正负样本，则提前终止该 prompt 的采样。
+        # gpt: 最终每个 prompt 只保留有限数量（final_keep_per_prompt）的样本，以减少训练负担并保证样本质量。
+
         # Build uid -> fields mapping from context
         ctx_uid_to_fields = {}
         if context_batch is not None:
             ctx_uid_to_fields = build_uid_to_fields_mapping(context_batch)
+        # gpt: 建立一个 uid 到上下文字段的映射，用于后续对齐（如奖励计算时保持 prompt 与 context 一致）。
 
         # Ensure orig_prompt_batch has uid
         ensure_uid_in_batch(orig_prompt_batch, context_batch)
         uid_arr = list(orig_prompt_batch.non_tensor_batch["uid"])
+        # gpt: 确保每个样本都有唯一标识 uid，便于跨轮追踪样本状态。
 
         # Initialize state tracking for each uid
         state = {uid: {"finished": False, "seen": 0, "pos": 0, "neg": 0} for uid in uid_arr}
+        # gpt: 初始化每个 uid 的状态信息：
+        # gpt: finished -> 是否完成采样
+        # gpt: seen -> 已生成的样本数
+        # gpt: pos/neg -> 当前累计的正/负样本数量
 
         # Caches for positive and negative samples per uid
         pos_cache = defaultdict(list)
@@ -45,12 +56,17 @@
         # For GRPO with global statistics estimation
         uid_full_stats = {uid: {"total_pos": 0, "total_neg": 0} for uid in uid_arr}
         rounds_info = {"per_round": []}
+        # gpt: pos_cache/neg_cache 用于暂存每轮采样的正/负样本；
+        # gpt: rounds_info 记录每轮统计信息（时间、平均reward、完成数量等）。
 
         # Main generation loop
         active_uids = set(uid_arr)
+        # gpt: active_uids 表示当前仍需要继续采样的 prompt。
         for r in range(max_rounds):
+            # gpt: 外层循环控制最多执行 max_rounds 轮采样。
             t0 = time.time()
             if not active_uids:
+                # gpt: 若所有 prompt 均已完成，则直接结束循环。
                 rounds_info["per_round"].append(
                     {
                         "round": r,
@@ -67,12 +83,15 @@
             active_indices = [uid_to_idx[uid] for uid in uid_arr if uid in active_uids]
             mini_prompt_batch = orig_prompt_batch[active_indices]
             round_inp = mini_prompt_batch.repeat(repeat_times=round_repeat, interleave=True)
+            # gpt: 仅为“活跃的” prompt 创建子批次 mini_prompt_batch。
+            # gpt: 然后重复采样 round_repeat 次以生成多个候选输出。
 
             # Pad to be divisible by dp_size
             dp_size = self.actor_rollout_wg.dp_size if hasattr(self.actor_rollout_wg, "dp_size") else 8
             batch_size = len(round_inp)
             padding_applied = False
             if batch_size % dp_size != 0:
+                # gpt: 为了在分布式训练中平衡数据，需要补齐 batch 使其能被 dp_size 整除。
                 padding_needed = dp_size - (batch_size % dp_size)
                 print(
                     f"Padding batch from {batch_size} to {batch_size + padding_needed} "
@@ -91,11 +110,13 @@
                 if not self.async_rollout_mode
                 else self.async_rollout_manager.generate_sequences(round_inp)
             )
+            # gpt: 根据 actor 模型生成文本序列，如果开启异步 rollout，则使用 async manager。
 
             # Remove padding if applied
             if padding_applied:
                 gen_out = gen_out[:batch_size]
                 round_inp = round_inp[:batch_size]
+            # gpt: 如果前面做过 padding，则在生成完毕后移除补充的样本。
 
             # Compute rewards for this round
             mini_with_out, seq_reward, uids_round = compute_seq_rewards_for_round(
@@ -109,11 +130,14 @@
                 kl_ctrl_in_reward=self.kl_ctrl_in_reward if self.config.algorithm.use_kl_in_reward else None,
             )
             seq_reward_np = seq_reward.detach().cpu().numpy().tolist()
+            # gpt: 对当前生成的输出计算奖励值（reward），
+            # gpt: 支持使用 reward_fn 或 reward model（RM），并在需要时应用 KL 惩罚。
 
             # Group by uid
             per_uid_local_idx = defaultdict(list)
             for j, uid in enumerate(uids_round):
                 per_uid_local_idx[uid].append(j)
+            # gpt: 将同一个 prompt（uid）的生成结果聚合到一起，以便单独统计正负样本数量。
 
             # Update state and cache samples
             completed_this_round = 0
@@ -137,12 +161,14 @@
                         st["neg"] += 1
                         neg_cache[uid].append(mini_with_out[[j]])
                         uid_full_stats[uid]["total_neg"] += 1
+                # gpt: 将本轮生成结果按 reward 分为正样本和负样本，分别存入缓存。
 
                 def downsample_cache(pos_cache, neg_cache, uid, target_total):
+                    # gpt: 下采样函数，根据目标数量从缓存中挑选平衡的正负样本。
                     target_pos = min(target_total // 2, len(pos_cache[uid]))
                     target_neg = min(target_total - target_pos, len(neg_cache[uid]))
                     if target_pos + target_neg < target_total:
-                        # Not enough total samples, adjust targets
+                        # gpt: 若不足目标数，则动态补充样本。
                         if len(pos_cache[uid]) > target_pos:
                             additional_pos = min(len(pos_cache[uid]) - target_pos, target_total - (target_pos + target_neg))
                             target_pos += additional_pos
@@ -157,6 +183,7 @@
                 # Check if we have enough samples to finish this uid
                 if not st["finished"]:
                     if self.config.algorithm.reinforce_ada_choice == "balanced":
+                        # gpt: 模式一：平衡采样，正负样本各占一半。
                         target_pos = final_keep_per_prompt // 2
                         target_neg = final_keep_per_prompt - target_pos
 
@@ -168,6 +195,7 @@
                             completed_this_round += 1
 
                     else:  # positive_focused
+                        # gpt: 模式二：以正样本为主，只要出现足够数量的正样本即可停止。
                         assert self.config.algorithm.reinforce_ada_choice == "positive_focused", (
                             "reinforce_ada_choice has to be one of {'balanced', 'positive_focused'}"
                         )
@@ -181,11 +209,13 @@
 
             # Update active set
             active_uids = {u for u in active_uids if not state[u]["finished"]}
+            # gpt: 更新当前活跃的 uid 集合（移除已完成的 prompt）。
 
             # Record timing and stats
             sec = time.time() - t0
             if timing_raw is not None:
                 timing_raw[f"gen_round_{r}_sec"] = sec
+            # gpt: 记录本轮耗时，用于性能分析。
 
             rounds_info["per_round"].append(
                 {
@@ -209,6 +239,7 @@
                 break
 
         # Handle fallback for uids that didn't reach target
+        # gpt: 对于未完成采样的 prompt，执行补救策略（fallback），从已有样本中尽量选出部分作为最终结果。
         uids_that_need_fallback = {uid for uid in uid_arr if not state[uid]["finished"]}
 
         for uid in uids_that_need_fallback:
@@ -225,6 +256,7 @@
                     )
 
                 if self.config.algorithm.reinforce_ada_choice == "positive_focused":
+                    # gpt: 在正样本优先模式下，根据正负比例重新计算应保留数量。
                     ratio = (pos_num / n_rows) if n_rows > 0 else 0.0
                     target_pos = math.ceil(ratio * final_keep_per_prompt)
                     target_pos = max(min(target_pos, take - 1), 1)
@@ -261,26 +293,32 @@
             raise RuntimeError(
                 "No samples selected after early stopping. Check if threshold/rules are too strict or data is abnormal"
             )
+        # gpt: 若最终没有任何样本被选出，则说明参数过严或奖励模型异常。
 
         # Concatenate all selected samples
         selected_batch = concat_dataproto_fragments(selected_pool_batches)
+        # gpt: 合并所有被选中的样本 batch。
 
         # Align context fields to selected batch
         _context_src = context_batch if context_batch is not None else orig_prompt_batch
         ctx_rows = align_context_to_selected(selected_batch, _context_src)
+        # gpt: 将上下文字段对齐（例如 prompt 文本、meta 信息等）。
 
         # Merge missing fields from context into selected batch
         merge_context_fields_into_batch(selected_batch, ctx_rows)
+        # gpt: 将上下文中缺失的字段合并回选中 batch。
 
         final_batch = selected_batch
 
         # Ensure token_level_scores exists (fallback to token_level_rewards)
         if "token_level_scores" not in final_batch.batch and "token_level_rewards" in final_batch.batch:
             final_batch.batch["token_level_scores"] = final_batch.batch["token_level_rewards"]
+        # gpt: 确保最终 batch 中存在 token 级别分数字段。
 
         # For GRPO with global stats, log pos/neg counts
         uid_to_pos_count = {uid: stats["total_pos"] for uid, stats in uid_full_stats.items()}
         uid_to_neg_count = {uid: stats["total_neg"] for uid, stats in uid_full_stats.items()}
+        # gpt: 记录每个 prompt 的全局正负样本数量，用于 GRPO 统计。
 
         if not hasattr(final_batch, "meta_info") or final_batch.meta_info is None:
             final_batch.meta_info = {}
@@ -289,8 +327,10 @@
 
         # Validate that we maintained efficient TensorDict structure
         validate_tensordict_performance(final_batch, context="final_batch")
+        # gpt: 验证 TensorDict 结构是否仍高效，防止拼接导致性能退化。
 
         return final_batch, rounds_info
+        # gpt: 返回最终采样批次和每轮的统计信息。
 
 
     def fit(self):
